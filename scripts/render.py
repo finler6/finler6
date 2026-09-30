@@ -3,7 +3,8 @@
     GH_TOKEN=... python3 scripts/render.py path/to/cascadia/ttf/static
 
 Writes assets/status-{light,dark}.svg (a `systemctl status` card) and
-assets/stats-{light,dark}.svg (public GitHub activity), both from the GraphQL API.
+assets/stats-{light,dark}.svg (public GitHub activity, plus the private
+contribution count when the profile shares it), both from the GraphQL API.
 The GitHub Actions workflow in .github/workflows/stats.yml runs this daily, so
 the uptime on the status card and the numbers on the stats card stay current.
 
@@ -190,6 +191,11 @@ AXES = [
     ("issues", "issues", "issues"),
 ]
 
+# Only shown when the profile has "Private contributions" turned on. GitHub
+# reports private work as a single number with no breakdown by type, so it
+# gets an axis of its own instead of being mixed into commits.
+PRIVATE_AXIS = ("private", "private contributions", "private")
+
 
 def graphql(query, **variables):
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
@@ -219,13 +225,14 @@ def fetch_profile(login, now):
     )["user"]
     # fromisoformat() only accepts a trailing "Z" from Python 3.11 on.
     created = dt.datetime.fromisoformat(user["createdAt"].replace("Z", "+00:00"))
-    stats = dict(commits=0, prs=0, reviews=0, issues=0, repos=user["repositories"]["totalCount"])
+    stats = dict(commits=0, prs=0, reviews=0, issues=0, private=0, repos=user["repositories"]["totalCount"])
     # The API only returns up to one year per request, so walk calendar years.
     for year in range(created.year, now.year + 1):
         collection = graphql(
             "query($login: String!, $from: DateTime!, $to: DateTime!) { user(login: $login) { "
             "contributionsCollection(from: $from, to: $to) { totalCommitContributions "
-            "totalPullRequestContributions totalPullRequestReviewContributions totalIssueContributions } } }",
+            "totalPullRequestContributions totalPullRequestReviewContributions totalIssueContributions "
+            "restrictedContributionsCount } } }",
             login=login,
             **{"from": f"{year}-01-01T00:00:00Z", "to": f"{year}-12-31T23:59:59Z"},
         )["user"]["contributionsCollection"]
@@ -233,6 +240,10 @@ def fetch_profile(login, now):
         stats["prs"] += collection["totalPullRequestContributions"]
         stats["reviews"] += collection["totalPullRequestReviewContributions"]
         stats["issues"] += collection["totalIssueContributions"]
+        # Contributions the viewer can't see. Non-zero only when the profile
+        # shares private contribution counts; the owner's own token sees those
+        # contributions directly, so for the owner this stays 0.
+        stats["private"] += collection["restrictedContributionsCount"]
     return dict(pid=user["databaseId"], created=created, stats=stats)
 
 
@@ -245,11 +256,14 @@ def stats_card(theme, stats, as_of, width):
     c = THEMES[theme]
     height = 204
     cx, cy, radius = 140, 104, 66
+    axes = AXES + [PRIVATE_AXIS] if stats["private"] else AXES
     parts = [card(width, height, c)]
 
+    def angle(index):
+        return math.radians(-90 + 360 / len(axes) * index)
+
     def point(index, r):
-        angle = math.radians(-90 + 72 * index)
-        return cx + r * math.cos(angle), cy + r * math.sin(angle)
+        return cx + r * math.cos(angle(index)), cy + r * math.sin(angle(index))
 
     def polygon(points, attrs):
         coords = " ".join(f"{num(x)},{num(y)}" for x, y in points)
@@ -257,14 +271,14 @@ def stats_card(theme, stats, as_of, width):
 
     grid = f'fill="none" stroke="{c["muted"]}" stroke-opacity=".35"'
     for level in (1 / 3, 2 / 3, 1):
-        parts.append(polygon([point(i, radius * level) for i in range(5)], grid))
-    for i in range(5):
+        parts.append(polygon([point(i, radius * level) for i in range(len(axes))], grid))
+    for i in range(len(axes)):
         x, y = point(i, radius)
         parts.append(
             f'<line x1="{cx}" y1="{cy}" x2="{num(x)}" y2="{num(y)}" stroke="{c["muted"]}" stroke-opacity=".35"/>'
         )
 
-    shape = [point(i, radius * spoke(stats[key])) for i, (_, _, key) in enumerate(AXES)]
+    shape = [point(i, radius * spoke(stats[key])) for i, (_, _, key) in enumerate(axes)]
     parts.append(
         polygon(
             shape,
@@ -277,20 +291,22 @@ def stats_card(theme, stats, as_of, width):
 
     label_size = 11
     label_cap = REGULAR.cap(label_size)
-    for i, (label, _, _) in enumerate(AXES):
+    for i, (label, _, _) in enumerate(axes):
         x, y = point(i, radius + 12)
         w = REGULAR.width(label, label_size)
-        if i == 0:
-            parts.append(text(REGULAR, label, label_size, x - w / 2, y, c["muted"]))
-        elif i in (1, 2):
+        dx, dy = math.cos(angle(i)), math.sin(angle(i))
+        if abs(dx) < 0.2:  # top or bottom tip: centre the label above or below it
+            parts.append(text(REGULAR, label, label_size, x - w / 2, y + (label_cap if dy > 0 else 0), c["muted"]))
+        elif dx > 0:
             parts.append(text(REGULAR, label, label_size, x, y + label_cap / 2, c["muted"]))
         else:
             parts.append(text(REGULAR, label, label_size, x - w, y + label_cap / 2, c["muted"]))
 
-    size, row_height = 12, 22
+    # Tighter rows when there are six, so the note below doesn't read as a seventh row.
+    size, row_height = 12, 22 if len(axes) <= 5 else 20
     left, right = 300, width - PAD_X
-    first = cy - (len(AXES) - 1) * row_height / 2 + REGULAR.cap(size) / 2
-    for row, (_, label, key) in enumerate(AXES):
+    first = cy - (len(axes) - 1) * row_height / 2 + REGULAR.cap(size) / 2
+    for row, (_, label, key) in enumerate(axes):
         baseline = first + row * row_height
         value = f"{stats[key]:,}"
         value_w = BOLD.width(value, size)
@@ -302,13 +318,15 @@ def stats_card(theme, stats, as_of, width):
             f'<line x1="{num(x1)}" y1="{num(baseline - 1)}" x2="{num(x2)}" y2="{num(baseline - 1)}" '
             f'stroke="{c["muted"]}" stroke-opacity=".6" stroke-dasharray="1 4" stroke-linecap="round"/>'
         )
-    note = f"public activity · {as_of}"
-    parts.append(text(REGULAR, note, 10, left, height - PAD_Y - 2, c["muted"]))
+    source = "public activity + private count" if stats["private"] else "public activity"
+    parts.append(text(REGULAR, f"{source} · {as_of}", 10, left, height - PAD_Y - 2, c["muted"]))
 
     label = (
         f"GitHub activity of {LOGIN}: {stats['commits']} commits, {stats['repos']} public repositories, "
         f"{stats['prs']} pull requests, {stats['reviews']} code reviews, {stats['issues']} issues"
     )
+    if stats["private"]:
+        label += f", {stats['private']} private contributions"
     return svg(width, height, "".join(parts), label)
 
 
