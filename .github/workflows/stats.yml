@@ -1,0 +1,53 @@
+# Re-renders the profile cards once a day so the activity numbers stay current.
+# Commits made with GITHUB_TOKEN don't trigger new workflow runs, so this can't loop.
+name: stats
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/stats.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stats
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get the font
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v2407.24 -R microsoft/cascadia-code --pattern 'CascadiaCode-*.zip' -D "$RUNNER_TEMP/font"
+          unzip -q "$RUNNER_TEMP"/font/CascadiaCode-*.zip -d "$RUNNER_TEMP/font"
+
+      - name: Render cards
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet fonttools==4.60.0
+          "$RUNNER_TEMP/venv/bin/python" scripts/render.py "$RUNNER_TEMP/font/ttf/static"
+
+      - name: Commit if anything changed
+        run: |
+          git add assets
+          if git diff --cached --quiet; then
+            echo "Cards are up to date"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "Update stats"
+          git push
