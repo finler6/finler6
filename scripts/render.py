@@ -2,9 +2,10 @@
 
     GH_TOKEN=... python3 scripts/render.py path/to/cascadia/ttf/static
 
-Writes assets/status-{light,dark}.svg (static text) and
-assets/stats-{light,dark}.svg (public GitHub activity, read via the GraphQL API).
-The GitHub Actions workflow in .github/workflows/stats.yml runs this daily.
+Writes assets/status-{light,dark}.svg (a `systemctl status` card) and
+assets/stats-{light,dark}.svg (public GitHub activity), both from the GraphQL API.
+The GitHub Actions workflow in .github/workflows/stats.yml runs this daily, so
+the uptime on the status card and the numbers on the stats card stay current.
 
 Text is converted to outlines with fontTools, so the cards look the same no
 matter which fonts the viewer has. Font: Cascadia Mono 2407.24,
@@ -12,6 +13,7 @@ SIL Open Font License 1.1 (https://github.com/microsoft/cascadia-code).
 """
 
 import datetime as dt
+import html
 import json
 import math
 import os
@@ -73,6 +75,7 @@ THEMES = {
 
 def svg(width, height, body, label, css=""):
     style = f"<style>{css}</style>" if css else ""
+    label = html.escape(label)
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{num(width)}" height="{num(height)}" '
         f'viewBox="0 0 {num(width)} {num(height)}" role="img" aria-label="{label}">'
@@ -95,20 +98,11 @@ def text(face, value, size, x, baseline, colour):
 
 STATUS_SIZE, STATUS_LINE, PAD_X, PAD_Y = 13, 21, 18, 16
 
-# (text, colour key, bold). "DOT" is the status bullet, drawn as a circle so it
-# can breathe like the indicator of a running unit.
-STATUS_LINES = [
-    [("$ ", "muted", False), ("systemctl status finler6", "text", False)],
-    [("DOT", "green", False), ("finler6.service", "text", True), (" - Gleb", "text", False)],
-    [("     Loaded: ", "muted", False), ("loaded (/etc/systemd/system/finler6.service; enabled)", "text", False)],
-    [("     Active: ", "muted", False), ("active (running)", "green", True)],
-    [("      Tasks: ", "muted", False), ("3 (C, C#, Python)", "text", False)],
-]
+# Both cards share one width, counted in terminal columns. The Active line is the
+# longest one and grows with the uptime; 74 columns fit "10 years 11 months ago".
+COLUMNS = 74
 
-STATUS_LABEL = (
-    "Terminal output of systemctl status finler6: finler6.service - Gleb, "
-    "active (running), tasks: C, C#, Python"
-)
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 DOT_CSS = (
     ".dot{animation:dot 2.4s ease-in-out infinite}"
@@ -117,22 +111,57 @@ DOT_CSS = (
 )
 
 
+def ago(start, now):
+    """Elapsed time the way systemd prints it, e.g. "6 years 8 months ago"."""
+    # systemd's USEC_PER_YEAR, USEC_PER_MONTH and USEC_PER_DAY, in seconds.
+    year, month, day = 31_557_600, 2_629_800, 86_400
+    seconds = int((now - start).total_seconds())
+
+    def unit(value, name):
+        return f"{value} {name}{'' if value == 1 else 's'}"
+
+    if seconds >= year:
+        return f"{unit(seconds // year, 'year')} {unit(seconds % year // month, 'month')} ago"
+    return f"{unit(seconds // month, 'month')} {unit(seconds % month // day, 'day')} ago"
+
+
+def status_lines(profile, now):
+    """Card text: one list of (text, colour key, bold) per line.
+
+    "DOT" is the status bullet, drawn as a circle so it can breathe like the
+    indicator of a running unit. The service "started" when the account was
+    created, and the PID is the account's numeric GitHub ID.
+    """
+    started = profile["created"]
+    since = f"since {WEEKDAYS[started.weekday()]} {started:%Y-%m-%d}; {ago(started, now)}"
+    return [
+        [("$ ", "muted", False), (f"systemctl status {LOGIN}", "text", False)],
+        [("DOT", "green", False), (f"{LOGIN}.service", "text", True), (" - Gleb", "text", False)],
+        [("     Loaded: ", "muted", False), (f"loaded (/etc/systemd/system/{LOGIN}.service; enabled)", "text", False)],
+        [("     Active: ", "muted", False), ("active (running)", "green", True), (f" {since}", "text", False)],
+        [("   Main PID: ", "muted", False), (f"{profile['pid']} ({LOGIN})", "text", False)],
+        [("      Tasks: ", "muted", False), ("3 (C, C#, Python)", "text", False)],
+    ]
+
+
 def cell():
     return REGULAR.width(" ", STATUS_SIZE)
 
 
-def card_width():
-    longest = max(sum(2 if t == "DOT" else len(t) for t, _, _ in line) for line in STATUS_LINES)
-    return PAD_X * 2 + longest * cell()
+def columns(line):
+    return sum(2 if value == "DOT" else len(value) for value, _, _ in line)
 
 
-def status_card(theme):
+def card_width(lines):
+    return PAD_X * 2 + max(COLUMNS, *(columns(line) for line in lines)) * cell()
+
+
+def status_card(theme, lines, width):
     c = THEMES[theme]
-    width = card_width()
     cap = REGULAR.cap(STATUS_SIZE)
-    height = PAD_Y * 2 + STATUS_LINE * (len(STATUS_LINES) - 1) + cap + 4
+    height = PAD_Y * 2 + STATUS_LINE * (len(lines) - 1) + cap + 4
     parts = [card(width, height, c)]
-    for row, line in enumerate(STATUS_LINES):
+    for row, line in enumerate(lines):
         baseline = PAD_Y + cap + row * STATUS_LINE
         x = PAD_X
         for value, colour, bold in line:
@@ -146,7 +175,8 @@ def status_card(theme):
                 continue
             parts.append(text(BOLD if bold else REGULAR, value, STATUS_SIZE, x, baseline, c[colour]))
             x += len(value) * cell()
-    return svg(width, height, "".join(parts), STATUS_LABEL, DOT_CSS)
+    label = ". ".join(" ".join("".join(v for v, _, _ in line if v != "DOT").split()) for line in lines)
+    return svg(width, height, "".join(parts), f"Terminal output: {label}", DOT_CSS)
 
 
 # --- stats card: radar of public activity plus the raw numbers ---------------
@@ -181,16 +211,17 @@ def graphql(query, **variables):
     return payload["data"]
 
 
-def fetch_stats(login):
+def fetch_profile(login, now):
     user = graphql(
-        "query($login: String!) { user(login: $login) { createdAt "
+        "query($login: String!) { user(login: $login) { databaseId createdAt "
         "repositories(ownerAffiliations: OWNER, privacy: PUBLIC) { totalCount } } }",
         login=login,
     )["user"]
+    # fromisoformat() only accepts a trailing "Z" from Python 3.11 on.
+    created = dt.datetime.fromisoformat(user["createdAt"].replace("Z", "+00:00"))
     stats = dict(commits=0, prs=0, reviews=0, issues=0, repos=user["repositories"]["totalCount"])
-    first_year = int(user["createdAt"][:4])
     # The API only returns up to one year per request, so walk calendar years.
-    for year in range(first_year, dt.date.today().year + 1):
+    for year in range(created.year, now.year + 1):
         collection = graphql(
             "query($login: String!, $from: DateTime!, $to: DateTime!) { user(login: $login) { "
             "contributionsCollection(from: $from, to: $to) { totalCommitContributions "
@@ -202,7 +233,7 @@ def fetch_stats(login):
         stats["prs"] += collection["totalPullRequestContributions"]
         stats["reviews"] += collection["totalPullRequestReviewContributions"]
         stats["issues"] += collection["totalIssueContributions"]
-    return stats
+    return dict(pid=user["databaseId"], created=created, stats=stats)
 
 
 def spoke(value):
@@ -210,9 +241,9 @@ def spoke(value):
     return max(0.04, min(1.0, math.log10(value + 1) / math.log10(1001)))
 
 
-def stats_card(theme, stats, as_of):
+def stats_card(theme, stats, as_of, width):
     c = THEMES[theme]
-    width, height = card_width(), 204
+    height = 204
     cx, cy, radius = 140, 104, 66
     parts = [card(width, height, c)]
 
@@ -288,9 +319,13 @@ def write(name, content):
 
 
 if __name__ == "__main__":
-    stats = fetch_stats(LOGIN)
-    print("stats:", stats)
-    as_of = dt.date.today().strftime("%b %Y")
+    now = dt.datetime.now(dt.timezone.utc)
+    profile = fetch_profile(LOGIN, now)
+    print("stats:", profile["stats"])
+    print("uptime:", ago(profile["created"], now))
+    lines = status_lines(profile, now)
+    width = card_width(lines)
+    as_of = now.strftime("%b %Y")
     for theme in THEMES:
-        write(f"status-{theme}.svg", status_card(theme))
-        write(f"stats-{theme}.svg", stats_card(theme, stats, as_of))
+        write(f"status-{theme}.svg", status_card(theme, lines, width))
+        write(f"stats-{theme}.svg", stats_card(theme, profile["stats"], as_of, width))
